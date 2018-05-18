@@ -1,0 +1,247 @@
+---
+title: "Biking @ Penn"
+author: "Jake"
+date: "June 23, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=F)
+```
+
+```{r}
+setwd("J:/Portfolio/Biking@Penn")
+library(tidyverse)
+library(foreign)
+library(ggmap)
+library(sf)
+
+#Network analyst
+#http://www.granthubert.com/network-analysis/
+
+#R
+#http://stackoverflow.com/questions/29573911/r-mapping-multiple-routes-using-ggmap
+#http://stackoverflow.com/questions/33416328/how-to-display-google-map-directions-given-latitude-and-longitude-information-in
+#http://stackoverflow.com/questions/27688549/for-each-type-of-function-call-to-route-geom-leg
+#http://flowingdata.com/2014/02/05/where-people-run/
+#http://www.inside-r.org/packages/cran/ggmap/docs/route
+```
+
+#Get dbf info
+```{r}
+#Check to see number of queries left for today
+  routeQueryCheck()
+
+#Starting and ending points
+  intersections <- read.dbf("PennArea_Streets_Intersections_coords.dbf", as.is = T) %>%
+                    mutate(iCOORD = paste(YCOORD, XCOORD, sep=","))%>%
+                    rename(iNumber = Number)
+    
+  buildings <- read.dbf("PennArea_Buildings_Centroids2_coords.dbf", as.is = T) %>%
+                mutate(bCOORD = paste(YCOORD, XCOORD, sep=",")) %>%
+                rename(bNumber = Number)
+
+  
+  buildings <-
+      st_read("PennArea_Buildings")
+    
+  get_directions <- expand.grid(Start = intersections$iCOORD,
+                                End = buildings$bCOORD,
+                                Type = c("bicycling", "walking"),
+                                stringsAsFactors = F,
+                                KEEP.OUT.ATTRS = F) %>%
+                    arrange(Start, End) %>%
+                    group_by(Type) %>%
+                    mutate(Route = row_number(),
+                           RouteType = paste0(Route, Type)) %>%
+                    ungroup() %>%
+                    left_join(select(intersections, Direction, iCOORD, iNumber), by = c("Start" = "iCOORD")) %>%
+                    left_join(select(buildings, bCOORD, bNumber), by = c("End" = "bCOORD")) 
+  
+ # write.csv(get_directions, "get_directions.csv", row.names = F)
+```
+
+```{r eval=F}
+
+#get_directions <- filter(get_directions, Route == 164) %>% head(1)
+  
+  route_df <- route(get_directions$Start[1], 
+                    get_directions$End[1], 
+                    mode = get_directions$Type[1], 
+                    structure = "route", 
+                    output = "simple") %>%
+              mutate(Type = get_directions$Type[1],
+                     Route = get_directions$Route[1],
+                     RouteType = paste0(Route,Type),
+                     iNumber = get_directions$iNumber[1],
+                     bNumber = get_directions$bNumber[1])
+
+start <- Sys.time()
+    for(i in 2:nrow(get_directions)){
+    get_route <- route(get_directions$Start[i], 
+                       get_directions$End[i], 
+                       mode = get_directions$Type[i], 
+                       structure = "route", 
+                       output = "simple") %>%
+              mutate(Type = get_directions$Type[i],
+                     Route = get_directions$Route[i],
+                     RouteType = paste0(Route,Type),
+                     iNumber = get_directions$iNumber[i],
+                     bNumber = get_directions$bNumber[i])
+    
+    route_df <<- rbind(route_df, get_route)
+    Sys.sleep(time = .5)
+    end <- Sys.time()
+    print(paste(i, "of", nrow(get_directions), 
+                round(i/nrow(get_directions),4)*100, "%", sep=" "))
+    print(end-start)
+    }
+route_df
+
+write.csv(route_df, "route_df.csv", row.names = F)    
+```
+
+
+Route Evaluation
+```{r}
+route_df <- read.csv("route_df.csv", stringsAsFactors = F)%>%
+              mutate(leg = ifelse(is.na(leg), lag(leg)+1, leg),
+                     RouteType = paste0(Route,Type)) #%>%
+              #left_join(select(get_directions, Route, contains("Number"))%>% distinct())
+              
+route_rank <-
+    route_df %>% 
+    filter(!is.na(miles)) %>%
+    group_by(Route, Type, iNumber) %>%
+    summarise(miles = sum(miles),
+              minutes = sum(minutes)) %>%
+    ungroup() %>%
+    select(-minutes) %>%
+    spread(key = Type, value = miles) %>%
+    mutate(diffMiles = bicycling-walking) %>%
+    group_by(iNumber) %>%
+      arrange(-diffMiles) %>%
+      mutate(Ord = row_number()) %>%
+      ungroup() %>%
+    filter(Ord==1#,diffMiles > 0.5
+           )%>%
+    arrange(-diffMiles) %>%
+    mutate(Rank = row_number()) %>%
+    left_join(select(intersections, Direction, iNumber))
+
+  longest_routes <- 
+      filter(route_df, Route %in% route_rank$Route) %>%
+      mutate(RouteType = paste0(Route, Type),
+             Width = ifelse(Type == "bicycling", 1.05, 1)) %>%
+      left_join(route_rank)
+
+  
+  route_QGIS <- 
+    select(longest_routes, miles, leg:Rank) %>%
+    group_by(RouteType) %>%
+    mutate(start = paste(lon, lat, sep=" "),
+           end = paste(lead(lon), lead(lat), sep=" ")) %>%
+    ungroup() %>%
+    filter(end != "NA NA") %>%
+    mutate(LINESTRING = paste0("LINE(", paste(start, end, sep=", "), ")")) %>%
+    group_by(Route, Type) %>%
+    summarise(RouteNumber = min(Route),
+              Miles = sum(miles),
+              MULTILINESTRING = 
+                        paste0("(", paste(LINESTRING, collapse=", "), ")")) %>%
+    ungroup()
+
+  route_QGIS$MULTILINESTRING[1]
+  
+  write.csv(longest_routes, "longest_routes.csv", row.names = F)
+  write.csv(route_QGIS, "route_QGIS.csv", row.names = F)
+```
+ 
+Maps
+```{r}  
+  myLocation <- with(longest_routes, 
+                   c(min(lon)-.001, min(lat)-.001, max(lon)+.001, max(lat)+.001))
+  
+  myMap <- get_map(location= myLocation, source="osm", color="bw")
+
+  ggmap(myMap)+
+  #ggplot()+
+    geom_path(data = route_df,
+              aes(x = lon, y = lat, color = Type, group=RouteType), 
+              size = .75, alpha = .7, lineend = "round")
+  
+  +
+  facet_wrap(~Rank, ncol = 5)
+
+  ggmap(myMap)+
+    geom_path(data = filter(longest_routes, Route ==9),
+              aes(x = lon, y = lat,  
+                  color = Type, group=RouteType), 
+              size = 2, alpha = .7, lineend = "round")
+  
+  
+#http://kb.tableau.com/articles/knowledgebase/using-path-shelf-pattern-analysis  
+```
+
+example problem
+```{r eval = F}
+routeQueryCheck()
+#2267 route queries remaining.
+
+route(from = "39.948502,-75.205253", 
+      to = "39.94955,-75.194881", 
+      mode = get_directions$Type[1], 
+      structure = "route", 
+      #override_limit = T,
+      output = "all")
+
+#$error_message
+#[1] "You have exceeded your daily request quota for this API. We recommend registering for a key at the Google Developers Console: https://console.developers.google.com/apis/credentials?project=_"
+#
+#$routes
+#list()
+#
+#$status
+```
+
+clustering
+```{r}
+#http://www.r-bloggers.com/hierarchical-clustering-in-r-2/
+cluster_data <- function(df, x, y, n, predict, method){
+                  item <- select(get(df), get(x), get(y), get(predict))
+
+                  clusters <- hclust(dist(item[,1:2]), method = method)
+                  clusterCut <- cutree(clusters, n)
+                  item$Cluster <- as.character(clusterCut)
+                  
+                  print(table(item$Cluster))
+                  print(table(item[,3]))
+
+                  a<-  ggplot(data = item, 
+                               aes(x=get(x), y=get(y), color = get(predict))) +
+                        geom_point(alpha = 0.5, size = 3.5) + 
+                        geom_point(col = clusterCut, alpha = 1, size = 1)+
+                        ggtitle(paste0(df, "\n(", method, " clustering)"))
+                  print(a)
+                }
+
+cluster_data("iris", "Petal.Length", "Petal.Width", n = 3, "Species", method = "complete")
+cluster_data("iris", "Petal.Length", "Petal.Width", n = 3, "Species", method = "average")
+cluster_data("iris", "Petal.Length", "Petal.Width", n = 3, "Species", method = "mcquitty")
+cluster_data("iris", "Petal.Length", "Petal.Width", n = 3, "Species", method = "median")
+cluster_data("iris", "Petal.Length", "Petal.Width", n = 3, "Species", method = "centroid")
+
+#need to remove predict parameter
+cluster_data("buildings", "XCOORD", "YCOORD", n = 2, method = "complete")
+cluster_data("buildings", "XCOORD", "YCOORD", n = 2, method = "average")
+cluster_data("buildings", "XCOORD", "YCOORD", n = 2, method = "mcquitty")
+cluster_data("buildings", "XCOORD", "YCOORD", n = 2, method = "median")
+cluster_data("buildings", "XCOORD", "YCOORD", n = 2, method = "centroid")
+
+
+cluster_data("intersections", "XCOORD", "YCOORD", n = 2, method = "complete")
+cluster_data("intersections", "XCOORD", "YCOORD", n = 2, method = "average")
+cluster_data("intersections", "XCOORD", "YCOORD", n = 2, method = "mcquitty")
+cluster_data("intersections", "XCOORD", "YCOORD", n = 2, method = "median")
+cluster_data("buildings", "XCOORD", "YCOORD", n = 2, method = "centroid")
+```

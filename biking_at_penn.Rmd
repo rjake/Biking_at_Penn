@@ -1,0 +1,273 @@
+---
+title: "Biking @ Penn"
+author: "Jake"
+date: "May 14, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=F)
+```
+
+#workspace
+```{r}
+#setwd("C:/Users/foxtr/Documents/GitHub/Biking_at_Penn")
+library(tidyverse)
+#library(stringr)
+#library(ggmap)
+library(googleway)
+library(geosphere)
+
+get_intersections <- read_csv("get_intersections.csv")
+get_centroids <- read_csv("get_centroids.csv")
+get_routes <- read_csv("route_distances.csv")
+```
+
+##preliminary map of upenn
+```{r}
+all_points <-
+    rbind(
+        get_centroids %>% select(X, Y) %>% mutate(type = "penn"),
+        get_intersections %>% select(X, Y) %>% mutate(type = "intersections")
+    )
+
+bbox <-
+    c(left = min(all_points$X) - 0.002, 
+      right = max(all_points$X) + 0.002, 
+      top = max(all_points$Y) + 0.002,
+      bottom = min(all_points$Y) - 0.002)#*1.1
+
+upenn <-
+    #get_googlemap("university of pennsylvania", zoom = 14)
+    get_stamenmap(bbox, zoom = 14, maptype = "toner-lines")
+
+ggmap(upenn) +
+    geom_point(data = all_points, aes(X,Y, color = type), 
+               shape = 21, size = 5, fill = "navyblue", stroke = 2) +
+    theme_void()
+```
+
+to get polylines, look at bottom answer: `googleway` package
+https://stackoverflow.com/questions/30270011/ggmap-route-finding-doesnt-stay-on-roads
+
+##build cross join of intersections to centroids
+```{r prep_routes, eval = F}
+get_directions <- 
+    expand.grid(
+        intersection = get_intersections$id,
+        centroid = get_centroids$id,
+        type = c("driving", "walking"),
+        stringsAsFactors = F,
+        KEEP.OUT.ATTRS = F) %>%
+    left_join(get_intersections %>% 
+                  select(id, start), by = c("intersection" = "id")) %>%
+    left_join(get_centroids %>% 
+                  select(id, end), by = c("centroid" = "id")) %>%
+    mutate(loc_pair = paste(intersection, centroid),
+           route = paste(loc_pair, type))
+```
+
+##function for googleway loop
+```{r gway_fn, eval = F}
+#set api info
+    #set_key(key = key)
+    #google_keys()
+
+#function for loop
+    get_route <- 
+        function(i) {
+            route_list <-
+                google_directions(origin = get_directions$start[i],
+                                  destination = get_directions$end[i],
+                                  #key = mykey,
+                                  mode = get_directions$type[i],
+                                  avoid = "highways",
+                                  simplify = TRUE)
+            
+        #return dataframe:
+            decode_pl(route_list$routes$overview_polyline$points) %>% 
+            mutate(loc_pair = get_directions$loc_pair[i],
+                   route = get_directions$route[i],
+                   type = get_directions$type[i],
+                   intersection = get_directions$intersection[i],
+                   centroid = get_directions$centroid[i],
+                   ord = row_number())
+        }
+
+#make base df    
+    make_routes <- get_route(1)
+
+#to track time for loop ####
+    time_diff <-
+        function(x){
+            difftime(Sys.time(), x, units = "secs") %>% 
+            as.numeric() %>% 
+            floor()
+        }
+
+#API loop ####
+    time_start <- Sys.time()
+    
+    for(i in 2:nrow(get_directions)){
+        #api loop & append make_routes df
+            make_routes <- rbind(make_routes, get_route(i))
+        #pause, otherwise google will freeze
+            Sys.sleep(0.5)
+        #progress
+            print(paste(i, "-", time_diff(time_start), 'seconds'))
+    }
+
+#write_csv(make_routes, "make_routes_googleway.csv")
+```
+
+##get distances
+```{r}
+#Did not grab distances when ran for the first time, this will use geosphere::distHaversine to calculate distances
+    route_distances <-
+        make_routes %>%
+        #slice(1:1000) %>% 
+        group_by(route) %>% 
+        mutate(lat2 = ifelse(ord == max(ord), lat, lead(lat)),
+               lon2 = ifelse(ord == max(ord), lon, lead(lon))) %>% 
+        ungroup() %>% 
+        rowwise() %>%
+        mutate(dist = distHaversine(c(lon, lat), c(lon2, lat2), r = 3958.756)) %>% 
+        ungroup()
+
+#write_csv(route_distances, "route_distances.csv")
+#plot routes
+    ggplot(route_distances, aes(lon, lat, group = route, color = type)) +
+        facet_grid(type~.) +
+        geom_path() +
+        #geom_text() +
+        coord_sf()
+```
+
+##about each pair
+```{r}
+    route_agg <-
+        get_routes %>% 
+        #route_distances %>% 
+        group_by(loc_pair, route, type, intersection) %>% 
+        summarise(dist = sum(dist)) %>% 
+        group_by(loc_pair) %>% 
+        mutate(abs_diff = ifelse(dist == min(dist), 0, max(dist)-min(dist))) %>% 
+        ungroup()
+
+#write_csv(route_agg, "route_agg.csv")
+```
+
+
+
+
+
+
+
+
+
+
+
+#PREP WORK --- NOT USING
+
+##convert shp to csv
+```{r make_csv, eval = F}
+library(sf)
+get_intersections <-
+    st_read("penn_street_intersections.shp") %>% 
+    #filter(Direction != "W") %>% 
+    cbind(st_coordinates(.)) %>% 
+    mutate(id = row_number() %>% str_pad(., 2, "l","0"),
+           start = paste(Y, X, sep = ",")) %>% 
+    st_set_geometry(NULL)
+
+get_centroids <-
+    st_read("penn_building_centroids.shp") %>% 
+    cbind(st_coordinates(.)) %>% 
+    mutate(id = row_number() %>% str_pad(., 2, "l","0"),
+           end = paste(Y, X, sep = ",")) %>% 
+    st_set_geometry(NULL)
+
+#write_csv(get_intersections, "get_intersections.csv")
+#write_csv(get_centroids, "get_centroids.csv")
+```
+
+##ggmap exploration
+```{r}
+a <-# loc_pair "16 19"
+    route(from = "39.9409445009992,-75.1976984808205",
+      to = "39.9549319483263,-75.1930786028087",
+      mode = "driving",
+      structure = "route")
+
+b <-
+    route(from = "39.948614,-75.2184281",
+      to = "39.9522327,-75.1947939",
+      mode = "walking",
+      structure = "route")
+
+ggplot() +
+    geom_path(data = a, aes(x = lon, y = lat), color = "red", size = 2) +
+    geom_path(data = b, aes(x = lon, y = lat), size = 1)
+
+a1 <- 
+    make_routes %>% 
+    filter(route == "08 29", type == "driving")
+
+
+
+ggplot() +
+    geom_path(data = make_routes, 
+              aes(x = lon, 
+                  y = lat, 
+                  group = route, 
+                  color = type), 
+              alpha = .2,
+              size = 1) +
+    geom_text(data = get_intersections, aes(X,Y, label = id), size = 8) +
+    geom_text(data = get_centroids, aes(X,Y, label = id), color = "blue") +
+    theme_classic()
+
+routeQueryCheck()
+```
+
+
+
+##ggmap routes loop
+```{r loop_function, eval = F}
+get_route <- 
+    function(i) {
+        route(from = get_directions$start[i],
+              to = get_directions$end[i], 
+              mode = get_directions$type[i], 
+              structure = "route") %>%
+        mutate(loc_pair = get_directions$loc_pair[i],
+               route = get_directions$route[i],
+               type = get_directions$type[i],
+               intersection = get_directions$intersection[i],
+               centroid = get_directions$centroid[i])
+    }
+
+make_routes <- get_route(1)
+
+time_diff <-
+    function(x){
+        difftime(Sys.time(), x, units = "secs") %>% as.numeric() %>% floor()
+    }
+
+time_start <- Sys.time()
+
+for(i in 2:nrow(get_directions)){
+
+    make_routes <- rbind(make_routes, get_route(i))
+    
+    Sys.sleep(0.5)
+    
+    print(paste(i, "-", time_diff(time_start), 'seconds'))
+}
+
+
+routeQueryCheck() #check to see how much of quota is used (2500)
+
+#write_csv(make_routes, "make_routes_ggmap.csv")
+
+```
